@@ -1,0 +1,378 @@
+'''
+Created on 20 avr. 2015
+
+@author: hsanfo
+'''
+import os, sys, getpass, struct, stat
+#import fnmatch, pwd, glob
+import fnmatch, glob
+#import os.path
+from twisted.conch.client import connect, default, options
+from twisted.conch.ssh import connection, common
+from twisted.conch.ssh import channel, filetransfer
+from twisted.protocols import basic
+from twisted.internet import reactor, stdio, defer, utils
+from twisted.python import log, usage, failure
+#from Lib.ntpath import _abspath_split
+
+
+
+
+#==================================A Class from cftp for the sftp subsystem invokation================
+"""
+I take It from the cftp lib because there is windows unsuported import in that package
+THis import is simply to simplify the invokation of the sftp subsytem
+"""
+class ClientOptions(options.ConchOptions):
+
+    synopsis = """Usage:   cftp [options] [user@]host
+         cftp [options] [user@]host[:dir[/]]
+         cftp [options] [user@]host[:file [localfile]]
+"""
+    longdesc = ("cftp is a client for logging into a remote machine and "
+                "executing commands to send and receive file information")
+
+    optParameters = [
+                    ['buffersize', 'B', 32768, 'Size of the buffer to use for sending/receiving.'],
+                    ['batchfile', 'b', None, 'File to read commands from, or \'-\' for stdin.'],
+                    ['requests', 'R', 5, 'Number of requests to make before waiting for a reply.'],
+                    ['subsystem', 's', 'sftp', 'Subsystem/server program to connect to.']]
+
+    compData = usage.Completions(
+        descriptions={
+            "buffersize": "Size of send/receive buffer (default: 32768)"},
+        extraActions=[usage.CompleteUserAtHost(),
+                      usage.CompleteFiles(descr="local file")])
+
+    def parseArgs(self, host, localPath=None):
+        self['remotePath'] = ''
+        if ':' in host:
+            host, self['remotePath'] = host.split(':', 1)
+            self['remotePath'].rstrip('/')
+        self['host'] = host
+        self['localPath'] = localPath
+
+
+
+
+
+
+class my_sftpLib(object):
+    
+    ps = 'm_sftpLib> '
+    delimiter = '\n'
+    
+    def __init__(self, client, f = None):
+        self.client = client
+        self.currentDirectory = ''
+        self.file = f
+        self.bufSize = 32768
+        self.Nrequest = 5
+    
+    def _ebCloseLf(self, f, lf):
+        lf.close()
+        return f
+    
+    def _cbGetOpenFile(self, rf, lf):
+        return rf.getAttrs().addCallback(self._cbGetFileSize, rf, lf)
+    
+    #---------------------------------------------------------------
+    def _cbSetCurDir(self, path):
+        self.currentDirectory = path
+        self._newLine()
+        
+    def _newLine(self):
+        if self.client.transport.localClosed:
+            return
+        self.transport.write(self.ps)
+        self.ignoreErrors = 0
+        if self.file:
+            l = self.file.readline()
+            if not l:
+                self.client.transport.loseConnection()
+            else:
+                self.transport.write(l)
+                self.lineReceived(l.strip())
+    
+    
+    
+    def _getFilename(self, line):
+        line.lstrip()
+        if not line:
+            return None, ''
+        if line[0] in '\'"':
+            ret = []
+            line = list(line)
+            try:
+                for i in range(1,len(line)):
+                    c = line[i]
+                    if c == line[0]:
+                        return ''.join(ret), ''.join(line[i+1:]).lstrip()
+                    elif c == '\\': # quoted character
+                        del line[i]
+                        if line[i] not in '\'"\\':
+                            raise IndexError, "bad quote: \\%s" % line[i]
+                        ret.append(line[i])
+                    else:
+                        ret.append(line[i])
+            except IndexError:
+                raise IndexError, "unterminated quote"
+        ret = line.split(None, 1)
+        if len(ret) == 1:
+            return ret[0], ''
+        else:
+            return ret
+        
+    
+    
+    
+    def _cbReadFile(self, files, l, directory, glob):
+        if not isinstance(files, failure.Failure):
+            if glob:
+                l.extend([f for f in files if fnmatch.fnmatch(f[0], glob)])
+            else:
+                l.extend(files)
+            d = directory.read()
+            d.addBoth(self._cbReadFile, l, directory, glob)
+            return d
+        else:
+            reason = files
+            reason.trap(EOFError)
+            directory.close()
+            return l
+        
+    
+     
+     
+    def _cbOpenList(self, directory, glob):
+        files = []
+        d = directory.read()
+        d.addBoth(self._cbReadFile, files, directory, glob)
+        return d
+    
+    
+    def _ebNotADirectory(self, reason, path, glob):
+        d = self.client.openDirectory(path)
+        d.addCallback(self._cbOpenList, glob)
+        return d
+     
+    
+    def _remoteGlob(self, fullPath):
+        print('looking up %s' % fullPath)
+        head, tail = os.path.split(fullPath)
+        print head, tail
+        if '*' in tail or '?' in tail:
+            glob = 1
+        else:
+            glob = 0
+        if tail and not glob: # could be file or directory
+            # try directory first
+            d = self.client.openDirectory(fullPath)
+            d.addCallback(self._cbOpenList, '')
+            d.addErrback(self._ebNotADirectory, head, tail)
+        else:
+            d = self.client.openDirectory(head)
+            d.addCallback(self._cbOpenList, tail)
+        return d
+    
+    
+    def _cbDisplayFiles(self, files, options):
+        files.sort()
+        if 'all' not in options:
+            files = [f for f in files if not f[0].startswith('.')]
+            #print files        #To display files in the folder
+            #com="cmd /K echo %s" %files
+            #os.system(com)
+            #return files
+            #print files
+            #print 'Returned files'
+        if 'verbose' in options:
+            lines = [f[1] for f in files]
+            #com="cmd /K echo %s" %lines
+            #os.system(com)
+            l =  '\n'.join(lines)
+            print ('Returned list \n%s' %l)
+            return lines
+            
+        else:
+            lines = [f[0] for f in files]
+        if not lines:
+            return None
+            print 'Return None'
+        else:
+            return '\n'.join(lines)
+            print 'Returned list'
+
+
+    def m_LSFolder(self, path):
+        
+        options = ['verbose']
+        
+        #path, rest = self._getFilename(rest)
+        fullPath = path
+        #if not path:
+        #   fullPath = self.currentDirectory + '/'
+        #else:
+        #    fullPath = os.path.join(self.currentDirectory, path)
+        d = self._remoteGlob(fullPath)
+        d.addCallback(self._cbDisplayFiles, options)
+        return d
+        
+    
+
+    #---------------------------------------------------------------
+    def _cbGetDone(self, ignored, rf, lf):
+        log.msg('get done')
+        rf.close()
+        lf.close()
+        #if self.useProgressBar:
+        #self.transport.write('\n')
+        return "Transferred %s to %s" % (rf.name, lf.name)
+    
+    
+    def _getNextChunk(self, chunks):
+        end = 0
+        for chunk in chunks:
+            if end == 'eof':
+                return # nothing more to get
+            if end != chunk[0]:
+                i = chunks.index(chunk)
+                chunks.insert(i, (end, chunk[0]))
+                return (end, chunk[0] - end)
+            end = chunk[1]
+        #bufSize = int(self.client.transport.conn.options['buffersize'])
+        bufSize = self.bufSize
+        chunks.append((end, end + bufSize))
+        return (end, bufSize)
+    
+    
+    def _cbGetRead(self, data, rf, lf, chunks, start, size, startTime):
+        if data and isinstance(data, failure.Failure):
+            log.msg('get read err: %s' % data)
+            reason = data
+            reason.trap(EOFError)
+            i = chunks.index((start, start + size))
+            del chunks[i]
+            chunks.insert(i, (start, 'eof'))
+        elif data:
+            log.msg('get read data: %i' % len(data))
+            lf.seek(start)
+            lf.write(data)
+            if len(data) != size:
+                log.msg('got less than we asked for: %i < %i' %
+                        (len(data), size))
+                i = chunks.index((start, start + size))
+                del chunks[i]
+                chunks.insert(i, (start, start + len(data)))
+            rf.total += len(data)
+        #if self.useProgressBar:
+            # self._printProgressBar(rf, startTime)
+        chunk = self._getNextChunk(chunks)
+        if not chunk:
+            return
+        else:
+            start, length = chunk
+        log.msg('asking for %i -> %i' % (start, start+length))
+        d = rf.readChunk(start, length)
+        d.addBoth(self._cbGetRead, rf, lf, chunks, start, length, startTime)
+        return d
+    
+    
+    
+    
+    
+    def _cbGetFileSize(self, attrs, rf, lf):
+        if not stat.S_ISREG(attrs['permissions']):
+            rf.close()
+            lf.close()
+            return "Can't get non-regular file: %s" % rf.name
+        rf.size = attrs['size']
+        #bufferSize = self.client.transport.conn.options['buffersize']
+        bufferSize = self.bufSize
+        #numRequests = self.client.transport.conn.options['requests']
+        numRequests = self.Nrequest
+        rf.total = 0.0
+        dList = []
+        chunks = []
+        #startTime = self.reactor.seconds()
+        startTime = reactor.seconds()
+    
+        print startTime
+        for i in range(numRequests):
+            d = self._cbGetRead('', rf, lf, chunks, 0, bufferSize, startTime)
+            dList.append(d)
+        dl = defer.DeferredList(dList, fireOnOneErrback=1)
+        dl.addCallback(self._cbGetDone, rf, lf)
+        return dl
+    
+    
+    
+    
+    
+    
+        
+    #==================Downloading file===========================   
+    def m_GetFile(self, local_path, remote_path):
+        
+       
+        lf = file(local_path, 'wb',0)                    #Creating of the local open file where to copy remote file
+        d = self.client.openFile(remote_path, filetransfer.FXF_READ, {}) # 
+        d.addCallback(self._cbGetOpenFile, lf)
+        d.addErrback(self._ebCloseLf, lf)
+        return d
+    #============================================================
+    #============================================================
+    
+    def _cbPutDone(self, ignored, rf, lf):
+        lf.close()
+        rf.close()
+        #if self.useProgressBar:
+        #    self.transport.write('\n')
+        return 'Transferred %s to %s' % (lf.name, rf.name)
+    
+    
+    
+    def _cbPutWrite(self, ignored, rf, lf, chunks, startTime):
+        chunk = self._getNextChunk(chunks)
+        start, size = chunk
+        lf.seek(start)
+        data = lf.read(size)
+        #if self.useProgressBar:
+        #    lf.total += len(data)
+        #    self._printProgressBar(lf, startTime)
+        if data:
+            d = rf.writeChunk(start, data)
+            d.addCallback(self._cbPutWrite, rf, lf, chunks, startTime)
+            return d
+        else:
+            return
+        
+        
+    
+    def _cbPutOpenFile(self, rf, lf):
+        numRequests = self.Nrequest
+        #if self.useProgressBar:
+        #   lf = FileWrapper(lf)
+        dList = []
+        chunks = []
+        startTime = reactor.seconds()
+        for i in range(numRequests):
+            d = self._cbPutWrite(None, rf, lf, chunks, startTime)
+            if d:
+                dList.append(d)
+        dl = defer.DeferredList(dList, fireOnOneErrback=1)
+        dl.addCallback(self._cbPutDone, rf, lf)
+        return dl
+
+    
+
+
+    #====================Uploading File==========================
+    def m_PutFile(self, local_path, remote_path):
+        
+        lf = file(local_path, 'rb')
+        flags = filetransfer.FXF_WRITE|filetransfer.FXF_CREAT|filetransfer.FXF_TRUNC
+        d = self.client.openFile(remote_path, flags, {})
+        d.addCallback(self._cbPutOpenFile, lf)
+        d.addErrback(self._ebCloseLf, lf)
+        return d
