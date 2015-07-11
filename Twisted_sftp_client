@@ -1,0 +1,411 @@
+# -*-conding:utf-8 -*-
+'''
+Created on 21 avr. 2015
+
+@author: hsanfo
+'''
+from sys import stdout
+import os
+from twisted.python.log import startLogging, err
+import stat
+import glob
+import time
+#import os.path
+from twisted.internet.defer import Deferred, succeed, gatherResults
+from twisted.conch.ssh.common import NS
+from twisted.conch.ssh.filetransfer import FileTransferClient
+from twisted.conch.client import connect, default
+from twisted.conch.ssh.connection import SSHConnection
+from twisted.conch.ssh.channel import SSHChannel
+from twisted.conch.ssh import filetransfer
+from twisted.internet import reactor
+#from twisted.conch.client.default import verifyHostKey
+
+
+from m_sftpLib import my_sftpLib, ClientOptions
+#from twisted.internet.task import deferLater
+
+
+
+#===============================================================================
+
+class SFTPSession(SSHChannel):
+    name = 'session'
+
+    def channelOpen(self, whatever):
+        d = self.conn.sendRequest(
+            self, 'subsystem', NS('sftp'), wantReply=True)
+        d.addCallbacks(self._cbSFTP)
+
+
+    def _cbSFTP(self, result):
+        client = FileTransferClient()
+        client.makeConnection(self)
+        self.dataReceived = client.dataReceived
+        self.conn._sftp.callback(client)
+
+
+
+class SFTPConnection(SSHConnection):
+    
+    def serviceStarted(self):
+        self.openChannel(SFTPSession())
+
+#=============================================================
+class ClientUserAuth(default.SSHUserAuthClient):
+    
+    
+    def __init__(self, user, passwd,  *args):
+        default.SSHUserAuthClient.__init__(self, user, *args)
+        self.m_password = passwd
+    
+    def getPassword(self, prompt = 'None'):
+        #normal password authentication
+        print "PASSWORD AUTH"
+        return succeed(self.m_password) # <-- YOUR PASSWORD
+
+    def getGenericAnswers(self, name, instruction, prompts):
+        #interactive password authentication
+        print "INTERACTIVE AUTH"
+        response = ['']*len(prompts)
+        for i, p in enumerate(prompts):
+            try:
+                if('password' in p[0].lower()):
+                    response[i] = self.m_password # <-- YOUR PASSWORD
+            except:
+                pass
+        #The response is always a sequence, and the length of it is always
+        #identical to the length of prompts
+        return succeed(response) 
+      
+
+
+
+
+class my_sftpClass():
+    
+    def __init__(self, user, host, port, pswd):
+        self.user = user
+        self.host = host
+        self.port = port
+        self.pswd = pswd
+        
+    def verifyHostKey(self, transport, host, pubKey, fingerprint):
+        print fingerprint 
+        return succeed(True)
+
+    def sftp(self,user, host, port, pswd):
+    
+        options = ClientOptions()
+        options['host'] = host
+        options['port'] = port
+        conn = SFTPConnection()
+        conn._sftp = Deferred()
+        auth = ClientUserAuth(user, pswd, options, conn)
+        #auth = SSHUserAuthClient(user, options, conn)
+        print 'authentication!!!'
+        connect.connect(host, port, options, self.verifyHostKey, auth)
+    
+        return conn._sftp
+    
+    ###################################################################################
+    ###############Do not call these two functions outside this class##################
+    ###################################################################################
+    def download(self, client, local_path, remote_path ):
+        client.openFile(remote_path, filetransfer.FXF_READ, {})
+        h = my_sftpLib(client)
+        d = h.m_GetFile( local_path, remote_path)
+        return d
+    
+    def upload(self, client, local_path, remote_path):
+        flags = filetransfer.FXF_WRITE|filetransfer.FXF_CREAT|filetransfer.FXF_TRUNC   
+        client.openFile(remote_path, flags, {})
+        h = my_sftpLib(client)
+        d = h.m_PutFile(local_path, remote_path)
+        return d
+    ####################################################################################
+    ####################################################################################
+    
+    #methode to use for download a file with known path
+    def doGET(self, local_path, remote_path):   
+        #f = my_sftpClass(user, host, port, pswd) 
+        d = self.sftp(self.user, self.host, self.port,self.pswd)
+        #d.addCallback(download,remote_path,local_path  )
+        d.addCallback(self.download,local_path,remote_path  )
+        d.addErrback(err, "Problem with SFTP transfer")
+        d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()
+        return d
+    
+    #methode to use for upload a file with known path
+    def doPUT(self, local_path, remote_path):   
+        #f = my_sftpClass(user, host, port, pswd) 
+        d = self.sftp(self.user, self.host, self.port,self.pswd)
+        #d.addCallback(download,remote_path,local_path  )
+        d.addCallback(self.upload,local_path,remote_path  )
+        d.addErrback(err, "Problem with SFTP transfer")
+        d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()
+        return d
+    
+    
+    
+    #methode to use for uploadload a filelist : NB: remote_path must be a directory
+    def doPUTFileList(self, local_pathList, remote_path):
+        
+        for filePattern in local_pathList:
+            if "\\" in filePattern:
+                print("Source is Windows Path: replacing back slash by slash")
+                filePatternc = filePattern.replace("\\","/")
+                local_pathList[local_pathList.index(filePattern)]=filePatternc
+        print local_pathList
+               
+        def _deffredLoopU(local_path,remote_path):
+            d = self.sftp(self.user, self.host, self.port,self.pswd)
+            d.addCallback(self.upload,local_path,remote_path  )
+            d.addErrback(err, "Problem with SFTP transfer")
+            return d
+        def f(p1):
+            if not (str(p1)).endswith('/'):
+                        p1=p1+"/"
+            return str(p1)
+        deferred_calls = [_deffredLoopU(str(mylocalfile), f(remote_path)+(str(mylocalfile).split('/')).pop()) for mylocalfile in local_pathList]
+        d2 = gatherResults(deferred_calls, consumeErrors = True)
+        #d2.addCallback(reactor.run())
+        d2.addErrback(err, "Problem with SFTP transfer")
+        d2.addCallback(lambda ignored: reactor.stop())
+        #d2.addBoth(reactor.stop(), reactor.run())
+        reactor.run()
+        return d2
+  
+    #methode to use for download a filelist : NB: localpath must be a directory
+    def doGETFileList(self, local_path, remote_pathList):
+        
+        for filePattern in remote_pathList:
+            if "\\" in filePattern:
+                print("Source is Windows Path: replacing back slash by slash")
+                filePatternc = filePattern.replace("\\","/")
+                remote_pathList[remote_pathList.index(filePattern)]=filePatternc
+        print remote_pathList
+
+        def _deffredLoop(local_path,remote_path):
+            d = self.sftp(self.user, self.host, self.port,self.pswd)
+            d.addCallback(self.download,local_path,remote_path  )
+            d.addErrback(err, "Problem with SFTP transfer")
+            return d
+        def f(p1):
+            if not (str(p1)).endswith('/'):
+                        p1=p1+"/"
+            return str(p1)
+        deferred_calls = [_deffredLoop(f(local_path)+(str(myfile).split('/')).pop() , str(myfile)) for myfile in remote_pathList]
+        d2 = gatherResults(deferred_calls, consumeErrors = True)
+        d2.addErrback(err, "Problem with SFTP transfer")
+        d2.addCallback(lambda ignored: reactor.stop())
+        reactor.run()              #To run the reactor (main loop), this can be done in the calling programme for speed purpose
+        return d2
+    
+    
+    # method to use for directory creation in the remote host
+    def mkdir(self, dir_name):
+        d = self.sftp(self.user, self.host, self.port,self.pswd)
+        def cbmkdir(client, dir_name):
+            d = client.makeDirectory(dir_name, {})
+            return d
+        d.addCallback(cbmkdir, dir_name)
+        d.addErrback(err, "Problem with directory creation!!")
+        d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()  
+        
+      
+    def downloadList(self, remote_pathList, local_path):  
+        
+        def _deffredLoop(local_path,remote_path):
+            d = self.sftp(self.user, self.host, self.port,self.pswd)
+            d.addCallback(self.download,local_path,remote_path  )
+            d.addErrback(err, "Problem with SFTP transfer")
+            return d
+        def f(p1):
+            if not (str(p1)).endswith('/'):
+                        p1=p1+"/"
+            return str(p1)
+        
+        deferred_calls = [_deffredLoop(f(local_path)+(str(myfile).split('/')).pop(), myfile) for myfile in remote_pathList]
+        d2 = gatherResults(deferred_calls, consumeErrors = True)
+        #d2.addErrback(err, "Problem with SFTP transfer")
+        #d2.addCallback(lambda ignored: reactor.stop())
+        #reactor.run()              #To run the reactor (main loop), this can be done in the calling programme for speed purpose
+        return d2
+    
+    
+    def uploadList(self, local_pathList, remote_path):
+        
+        def _deffredLoop(local_path,remote_path):
+            d = self.sftp(self.user, self.host, self.port,self.pswd)
+            d.addCallback(self.upload, local_path, remote_path)
+            d.addErrback(err, "Problem with SFTP transfer")
+            return d
+        
+        def f(p1):
+            if not (str(p1)).endswith('/'):
+                        p1=p1+"/"
+            return str(p1)
+        
+        deferred_calls = [ _deffredLoop(myfile, f(remote_path)+(str(myfile).split('/')).pop()) for myfile in local_pathList]
+        d = gatherResults(deferred_calls, consumeErrors = True)
+        return d
+     
+     
+     
+    def PutFolderFiles(self,  localfullpath, remote_path): #We suppuse we are in Windws OS as client SFTP
+        
+        def _cbFolderOpener(client, localfullpath):
+            liste = glob.glob(localfullpath)
+            return liste
+    
+        def _cbFolderDisplayerder(liste):
+            for element in liste:
+                if os.path.isdir(element):
+                    print("'%s' un dossier" % element)
+                else:
+                    print("'%s' est un fichier" % element)
+            return liste
+        
+        def _cbFolderFileSelector(liste):
+            
+            Folderfiles = [f.replace('\\','/') for f in liste if not os.path.isdir(f)]
+            print ('la liste finale des fichiers du dossier %s est ' %Folderfiles)
+            return Folderfiles
+        
+        def _cbmkdir(client, dir_name):
+            d = client.makeDirectory(dir_name, {})
+            return d
+        
+        remote_folder = remote_path  + localfullpath.rsplit('/',1)[0]
+        if '\\' in remote_folder:
+            remote_folder = remote_folder.replace('\\','/')
+        elif '//' in remote_folder:
+            remote_folder = remote_folder.replace('//','/')
+        
+        d = self.sftp(self.user, self.host, self.port,self.pswd)
+        #d.addCallback(_cbmkdir, localfullpath.rsplit('/',1)[0])
+        d.addCallback(_cbFolderOpener, localfullpath)
+        d.addCallback(_cbFolderDisplayerder)
+        d.addCallback(_cbFolderFileSelector)
+        d.addCallback(self.uploadList, remote_path )
+        d.addErrback(err, "Problem with folder listing!!")
+        d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()  
+        return d
+    
+    
+    
+    def GetFolderFiles(self,  local_path, remotefullpath):
+        
+        d = self.sftp(self.user, self.host, self.port,self.pswd)
+        
+        def _cbFolderOpener(client, remotefullpath):
+            d =  my_sftpLib(client).m_LSFolder(remotefullpath)
+            #d =  my_sftpLib(client)._remoteGlob(remotefullpath)
+            return d
+        
+        def _cbFolderDisplayerder(liste):
+            print ('The Folder : %s ' %remotefullpath + 'content is %s ' %liste)
+            files = [remotefullpath.rsplit('/',1)[0]+'/'+f.split()[8] for f in liste]
+            #filesl = [f.split()[8] for f in liste]
+            print ('The files and directories names List are : %s' %files)
+            return liste
+        
+        def _cbFolderFileSelector(liste):
+            folder_files = [remotefullpath.rsplit('/',1)[0]+'/'+fl.split()[8] for fl in liste if  fl.split()[0][0] == '-']
+            print ('The files in  %s' %remotefullpath + 'folder are %s' %folder_files)
+            return folder_files
+        
+        local_folder = local_path  + remotefullpath.rsplit('/',1)[0]
+        
+        if '\\' in local_folder:
+            local_folder = local_folder.replace('\\','/')
+        elif '//' in local_folder:
+            local_folder = local_folder.replace('//','/')
+            
+        try:
+            os.makedirs(local_folder)
+            print ('Created Path is : %s' %local_folder)
+        except:
+            pass        
+    
+        d.addCallback(_cbFolderOpener, remotefullpath)
+        d.addCallback(_cbFolderDisplayerder)
+        d.addCallback(_cbFolderFileSelector)
+        d.addCallback(self.downloadList, local_folder)
+        d.addErrback(err, "Problem with folder listing!!")
+        d.addCallback(lambda ignored: reactor.stop())
+        reactor.run()  
+        return d
+
+
+
+
+    
+    
+
+
+
+
+
+################For testing##################
+if __name__ == "__main__":
+    
+    startLogging(stdout)
+    '''user = 'sftp'
+    host = '192.168.29.129'
+    port = 22
+    pswd = 'test'
+    remoteList = ['/home/sftp/directorytest/test.pdf', '/home/sftp/directorytest/file.pdf']
+    remote_path = '/home/sftp/directorytest/Abbaa.pdf'
+    print remote_path
+    local_path = 'C:/Users/hsanfo/Desktop/test_ftp'
+    lf1 = 'C:/Users/hsanfo/Desktop/test_ftp/file.pdf'
+    lf2 = 'C:/Users/hsanfo/Desktop/test_ftp/Ondiraitquecamarche.pdf'
+  
+    localList = ["C:/Users/hsanfo/Downloads\\tdm64.exe", "C:/Users/hsanfo/Desktop/test_ftp/file.pdf"]
+    rmotedir = '/home/sftp/*'
+    local_folder = 'C:/Users/hsanfo/Desktop/*.zip'
+    remotefolder = '/home/sftp/uploadListTestDir'
+    
+    
+    
+    
+    #my_sftpClass(user, host, port, pswd).doPUTFileList(localList, rmotedir)
+    #my_sftpClass(user, host, port, pswd).doGETFileList(local_path, remoteList)
+    #my_sftpClass(user, host, port, pswd).doPUT(lf1, remote_path)
+    #my_sftpClass(user, host, port, pswd).doGET(lf2, remote_path)
+    #my_sftpClass(user, host, port, pswd).mkdir('dir_name/voyons/')
+    #my_sftpClass(user, host, port, pswd).GetFolderFiles(local_path, rmotedir)
+    #my_sftpClass(user, host, port, pswd).PutFolderFiles(local_folder, remotefolder)
+    #print 'Result OK!!!!!!!!!!!'
+    #reactor.run()
+    '''
+    #user = 'modemlte'
+    #host = 'frmrszvli002.ctf.cit.alcatel.fr'
+    #port = 22
+    #pswd = 'modemlte@123'
+    user = 'enb0dev'
+    host = '172.26.104.60'
+    port = 22
+    pswd = 'Qwe*90op'
+    modemlte = '/home/modemlte/TestTwisted/'
+    localclient = 'C:/Users/hsanfo/Desktop/*.zip'
+    
+    modemlte2 = '/home/modemlte/TestTwisted/*.zip'
+    localclient2 = 'C:/Users/hsanfo/Desktop/test_ftp'
+    
+    tmps1 = time.clock()
+    #for i in range(2):
+        
+    #my_sftpClass(user, host, port, pswd).PutFolderFiles(localclient, modemlte)
+    #my_sftpClass(user, host, port, pswd).GetFolderFiles(localclient2, modemlte2)
+    lf1 = 'C:/Users/hsanfo/Desktop/test_ftp/file.pdf'
+    my_sftpClass(user, host, port, pswd).doPUT(lf1,'/')
+    tmps2 = time.clock()
+    print 'Result OK!!!!!!!!!!! in %s seconds ' %(tmps2-tmps1)
+    #reactor.run()  
