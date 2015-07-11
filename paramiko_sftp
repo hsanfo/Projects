@@ -1,0 +1,227 @@
+# -*-coding:utf-8 -*
+####################################################################
+#InspirÃ© en grande partie du fichier FTOLib.py  prÃ©sent sur le wiki#
+####################################################################
+
+
+import paramiko
+import traceback
+import sys
+import threading
+
+
+import time
+from paramiko import Transport
+
+class SFTP:
+    def __init__(self, IP_address, login, passwd, port, privkeyfile, key_passphrase):
+        try:
+            self.m_isConnected = False
+            self.m_sshIP = IP_address
+            self.m_sshLogin = login
+            self.m_sshport = port
+            self.eof = False
+            
+            self.m_sshHandle = None
+            self.m_sshChannel = None
+            
+            # reset to zero when set_current_buffer is called
+            self.m_tempBuffer = ""
+            # only reset manually
+            self.m_currentBuffer = ""
+            
+            self.m_counterEmptyBuffer = 0
+            # deactivates INFO logging in your application from paramiko
+            #logging.getLogger("paramiko").setLevel(logging.WARNING)
+
+            if privkeyfile!=None and privkeyfile!="":
+                myTransport=self.transport = Transport(self.m_sshIP)
+                myTransport.start_client()
+                time.sleep(15)
+                print("Getting key file")
+                self.privatekeyfile = privkeyfile
+                print("Filename is:  "+ str(self.privatekeyfile))
+                mykey = paramiko.RSAKey.from_private_key_file(self.privatekeyfile, password=key_passphrase)
+                print("The key is ready")
+                myTransport.auth_publickey(self.m_sshLogin,mykey)
+            elif passwd!=None and (privkeyfile==None or privkeyfile==""):
+                myTransport=self.transport =paramiko.Transport((self.m_sshIP, self.m_sshport))
+                event = threading.Event() 
+                myTransport.start_client(event)
+                #myTransport.start_client()
+                #myTransport.connect( )
+                #time.sleep(15)
+                event.wait(100)
+                if not myTransport.is_active():
+                    print("SSH negotiation failed.")
+                    sys.exit(1)
+                else:
+                    print("SSH negotiation successful")
+                myTransport.auth_password(self.m_sshLogin,passwd)
+                myTransport.set_keepalive(100)
+                #event.wait(timeout)(100)
+                print("Transport entity authenticated!!!!!!!")
+                #=========Alternative example ======================================================
+                #  ATTENTION:  to use you have to modify paramiko.SFTPClient.from_transport in next methods
+                # # Create instance of the SSHClient class
+                # MyClient = paramiko.SSHClient()
+                # # Create instance of the AutoAddPolicy class
+                # addpolicy = paramiko.AutoAddPolicy()
+                # # Set the missing host key policy to "auto add", because we can't
+                # # read the host keys on the system
+                # MyClient.set_missing_host_key_policy(addpolicy)
+                # # Connect to a remote host (va2sprva98, in this instance)
+                # MyClient.connect(self.m_sshIP, 22, self.m_sshLogin, passwd)
+                # self.transport=MyClient.get_transport()
+                #===============================================================
+            else:
+                print("ERROR: no key file nor password are furnished, no connection possible")    
+        except:
+            traceback.print_tb(sys.exc_info()[2])
+            print(sys.exc_info())
+
+    def getmyFile(self, remotepath, localpath):
+        try:
+            sftp1 = paramiko.SFTPClient.from_transport(self.transport)
+            sftp1 = self.transport.open_sftp_client()
+            # examples:
+            # remotepath='/var/www/images/file.png'
+            # localpath='/tmp/file.png'
+            #print("sftp entity has been created!!!!")
+            #sftp1.getcwd()
+            #print("listing of the current working directory!!")
+            sftp1.get(remotepath, localpath)
+            print("File has been transferred")
+            sftp1.close()
+        except:
+            traceback.print_tb(sys.exc_info()[2])
+            print(sys.exc_info())            
+        
+    def putmyFile(self, localpath, remotepath):
+        try:
+            sftp = paramiko.SFTPClient.from_transport(self.transport)
+            result=sftp.put(localpath,remotepath)
+            print("PUT Result is  :  " +str(result))
+            sftp.close()
+        except:
+            traceback.print_tb(sys.exc_info()[2])
+            print(sys.exc_info())
+            
+    def getmyFileList(self, remotepathList, localpath):
+        try:
+            sftp = paramiko.SFTPClient.from_transport(self.transport)
+        except:
+            traceback.print_tb(sys.exc_info()[2])
+            print(sys.exc_info())
+        else:
+            # examples:
+            # remotepath='/var/www/images/file.png'
+            # localpath='/tmp/file.png'
+            for remotepath in remotepathList:
+                #localpath must be a directory !!
+                myfile=str(remotepath)
+                myFileName=(myfile.split('/')).pop()
+                localFolderFilePath=localpath+myFileName
+                print("Local file path:   "+localFolderFilePath)
+                try:
+                    sftp.get(remotepath, localFolderFilePath)
+                    print("File have been transferred")
+                except:
+                    print("File transfer error for: "+remotepath)
+                    traceback.print_tb(sys.exc_info()[2])
+                    print(sys.exc_info())                    
+            sftp.close()
+            
+        
+    def putmyFileList(self, localpathList, remotepath):
+        try:
+            sftp = paramiko.SFTPClient.from_transport(self.transport)
+        except:
+            traceback.print_tb(sys.exc_info()[2])
+            print(sys.exc_info())
+        else:
+            for localpath in localpathList:
+                #remotepath must be a directory !!
+                myfile=str(localpath)
+                myFileName=(myfile.split('\\')).pop()
+                if not (str(remotepath)).endswith('/'):
+                    remotepath=remotepath+"/"
+                remoteFilePath=remotepath+myFileName
+                result=sftp.put(localpath,remoteFilePath)
+                print("PUT Result is  :  " +str(result))
+            sftp.close()
+
+    
+    def listRemoteFiles(self, remotepath):
+        # returns a list of filenames
+        result=None
+        try:
+            sftp = paramiko.SFTPClient.from_transport(self.transport)
+            if remotepath!=None:
+                result=sftp.listdir(remotepath)
+            else:
+                result=sftp.listdir()
+            sftp.close()
+        except:
+            traceback.print_tb(sys.exc_info()[2])
+            print(sys.exc_info())    
+        return result    
+    
+    def quitmysftp(self):
+        #Finally, close the SFTP connection and the transport:
+        self.transport.close()
+
+
+
+
+
+paramiko.util.log_to_file("TestSFTP_log.log") #def log file
+'''host = "192.168.29.129" #address de test
+port = 22         #Port server
+login = 'test' # ID auth de test
+pwd = 'test'#-------
+
+msftp = SFTP(host, login, pwd, port, None, None)
+print("SSH tunnel established!!!!!!!!! ")
+#remotepath = "test_rsa.key"
+remotepath = "/home/test/Desktop/test_rsa.key"
+localpath = "C:/Users/hsanfo/Desktop/"
+msftp.getmyFile(remotepath,localpath)
+print("Call of the download funtion!!!")
+
+'''
+'''user = 'modemlte'
+host = 'frmrszvli002.ctf.cit.alcatel.fr'
+port = 22
+pswd = 'modemlte@123'
+'''
+user = 'enb0dev'
+host = '172.26.104.60'
+pswd = 'Qwe*90op'
+port = 22
+msftp = SFTP(host, user, pswd, port, None, None)
+print("SSH tunnel established!!!!!!!!! ")
+
+lf1 = "C:/Users/hsanfo/Desktop/worspaceLTE.zip"
+lf2 = "C:/Users/hsanfo/Desktop/setuptools-14.3.1.zip"
+
+rf1 = "/home/modemlte/TestParamiko/worspaceLTE.zip"
+rf2 = "/home/modemlte/TestParamiko/setuptools-14.3.1.zip"
+lf11 = "C:/Users/hsanfo/Desktop/test_ftp/worspaceLTE.zip"
+lf22 = "C:/Users/hsanfo/Desktop/test_ftp/setuptools-14.3.1.zip"
+
+localpath = "C:/Users/hsanfo/Desktop/LR13_3"
+#print("Call of the download funtion!!!")
+#msftp.getmyFile(remotepath,localpath)
+localpath2 = "C:/Users/hsanfo/Downloads/WorkspaceLTEwc.zip"
+#Mesure du temps de chargement
+t1 = time.clock()
+#msftp.putmyFile(lf1,rf1)
+#msftp.putmyFile(lf2, rf2)
+msftp.getmyFile(rf1,lf11)
+#msftp.getmyFile(rf2,lf22)
+t2 = time.clock()
+
+print ( 'Result OK!! in %s second' %(t2-t1))
+
+
